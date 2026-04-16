@@ -1,0 +1,26 @@
+# Environments
+asl_env/
+env/
+venv/
+.env
+.venv
+__pycache__/
+*.pyc
+
+# IDEs
+.vscode/
+.idea/
+.ipynb_checkpoints/
+
+# Dataset and Models
+models/*.pth
+models/*.zip
+output/
+scratch/
+dataset/
+*.png
+*.jpg
+*.jpeg
+
+# Artifacts
+artifacts/
