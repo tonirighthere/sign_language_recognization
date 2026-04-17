@@ -1,6 +1,6 @@
-# ============================================
 # REAL-TIME HYBRID ASL RECOGNITION
-# ============================================
+# Bật môi trường ảo: .\asl_env\Scripts\activate
+# Chạy: python app.py
 
 import cv2
 import numpy as np
@@ -23,7 +23,7 @@ class HybridASLRecognizer:
         with open(metadata_path, 'r') as f:
             self.metadata = json.load(f)
         self.class_mapping = self.metadata['class_mapping']
-        self.idx_to_class = {v: k for k, v in self.class_mapping.items()}
+        self.idx_to_class = {int(k): v for k, v in self.class_mapping.items()}
         self.num_classes = len(self.class_mapping)
         
         # Load CNN model (cho static)
@@ -32,8 +32,7 @@ class HybridASLRecognizer:
         # Load BiLSTM model (cho dynamic)
         self.bilstm_model = self._load_bilstm_model(bilstm_model_path)
         
-        # Frame buffer cho dynamic recognition
-        self.frame_buffer = deque(maxlen=seq_length)
+        # Keypoints buffer cho BiLSTM
         self.keypoints_buffer = deque(maxlen=seq_length)
         
         # Motion detection
@@ -56,19 +55,29 @@ class HybridASLRecognizer:
         )
         self.mp_drawing = mp.solutions.drawing_utils
         
+        # Colors for fingers
+        self.finger_colors = {
+            'thumb': (0, 255, 255), 'index': (255, 0, 255), 'middle': (0, 255, 0),
+            'ring': (255, 0, 0), 'pinky': (0, 165, 255), 'palm': (255, 255, 255)
+        }
+        
         # Hand connections
         self.hand_connections = [
-            (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
-            (0, 9), (9, 10), (10, 11), (11, 12), (0, 13), (13, 14), (14, 15),
-            (15, 16), (0, 17), (17, 18), (18, 19), (19, 20)
+            (0, 1, 'palm'), (0, 5, 'palm'), (0, 9, 'palm'), (0, 13, 'palm'), (0, 17, 'palm'),
+            (5, 9, 'palm'), (9, 13, 'palm'), (13, 17, 'palm'),
+            (1, 2, 'thumb'), (2, 3, 'thumb'), (3, 4, 'thumb'),
+            (5, 6, 'index'), (6, 7, 'index'), (7, 8, 'index'),
+            (9, 10, 'middle'), (10, 11, 'middle'), (11, 12, 'middle'),
+            (13, 14, 'ring'), (14, 15, 'ring'), (15, 16, 'ring'),
+            (17, 18, 'pinky'), (18, 19, 'pinky'), (19, 20, 'pinky')
         ]
         
-        # Smoothing
-        self.prediction_buffer = deque(maxlen=5)
+        # Smoothing - buffer lớn hơn giúp ổn định hơn
+        self.prediction_buffer = deque(maxlen=10)
         
-        print(f"✅ Hybrid recognizer initialized")
-        print(f"   Device: {self.device}")
-        print(f"   Mode: Static (CNN) + Dynamic (BiLSTM) for J/Z")
+        print(f"Hybrid recognizer initialized")
+        print(f"Device: {self.device}")
+        print(f"Mode: Static (CNN) + Dynamic (BiLSTM)")
     
     def _load_cnn_model(self, model_path):
         """Load CNN model cho static recognition"""
@@ -76,19 +85,26 @@ class HybridASLRecognizer:
             def __init__(self, num_classes=29, img_size=224):
                 super().__init__()
                 self.features = nn.Sequential(
-                    nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
-                    nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
-                    nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
+                    nn.Conv2d(3, 32, kernel_size=3, padding=1), nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+                    nn.Conv2d(32, 32, kernel_size=3, padding=1), nn.BatchNorm2d(32), nn.ReLU(inplace=True), nn.MaxPool2d(2, 2),
+                    
+                    nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+                    nn.Conv2d(64, 64, kernel_size=3, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True), nn.MaxPool2d(2, 2),
+                    
+                    nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+                    nn.Conv2d(128, 128, kernel_size=3, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True), nn.MaxPool2d(2, 2),
+                    
+                    nn.Conv2d(128, 256, kernel_size=3, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+                    nn.AdaptiveAvgPool2d((1, 1))
                 )
-                self._to_linear = 128 * (img_size // 8) * (img_size // 8)
                 self.classifier = nn.Sequential(
-                    nn.Dropout(0.3), nn.Linear(self._to_linear, 256), nn.ReLU(),
-                    nn.Dropout(0.3), nn.Linear(256, num_classes)
+                    nn.Dropout(0.4), nn.Linear(256, 128), nn.BatchNorm1d(128), nn.ReLU(inplace=True),
+                    nn.Dropout(0.2), nn.Linear(128, num_classes)
                 )
             
             def forward(self, x):
                 x = self.features(x)
-                x = x.view(x.size(0), -1)
+                x = torch.flatten(x, 1)
                 return self.classifier(x)
         
         model = LightweightASL_CNN(num_classes=self.num_classes, img_size=self.img_size)
@@ -110,33 +126,64 @@ class HybridASLRecognizer:
             def forward(self, x):
                 weights = torch.softmax(self.attention(x).squeeze(-1), dim=1)
                 return torch.sum(x * weights.unsqueeze(-1), dim=1), weights
-        
-        class BiLSTM_Attention(nn.Module):
-            def __init__(self, input_size=63, hidden_size=128, num_layers=2, num_classes=29):
+                
+        class MultiHeadAttention(nn.Module):
+            def __init__(self, hidden_size, num_heads=4):
                 super().__init__()
-                self.bn = nn.BatchNorm1d(input_size)
-                self.lstm = nn.LSTM(input_size, hidden_size, num_layers, 
-                                    batch_first=True, bidirectional=True, dropout=0.3)
-                self.attention = AdditiveAttention(hidden_size * 2)
-                self.fc1 = nn.Linear(hidden_size * 2, 128)
-                self.fc2 = nn.Linear(128, num_classes)
-                self.dropout = nn.Dropout(0.3)
-                self.relu = nn.ReLU()
+                self.hidden_size = hidden_size
+                self.num_heads = num_heads
+                self.head_dim = hidden_size // num_heads
+                self.query = nn.Linear(hidden_size, hidden_size)
+                self.key = nn.Linear(hidden_size, hidden_size)
+                self.value = nn.Linear(hidden_size, hidden_size)
+                self.out = nn.Linear(hidden_size, hidden_size)
+                self.dropout = nn.Dropout(0.1)
                 
             def forward(self, x):
-                batch, seq, feat = x.shape
-                x = self.bn(x.view(-1, feat)).view(batch, seq, feat)
-                lstm_out, _ = self.lstm(x)
-                context, _ = self.attention(lstm_out)
+                batch_size, seq_len, _ = x.shape
+                Q = self.query(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+                K = self.key(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+                V = self.value(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+                scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+                attention_weights = torch.softmax(scores, dim=-1)
+                attention_weights = self.dropout(attention_weights)
+                context = torch.matmul(attention_weights, V)
+                context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+                return self.out(context), attention_weights
+
+        class BiLSTM_Attention(nn.Module):
+            def __init__(self, input_size=75, hidden_size=128, num_layers=2, num_classes=29, dropout=0.3, attention_type='multihead'):
+                super().__init__()
+                self.layer_norm_in = nn.LayerNorm(input_size)
+                self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, bidirectional=True, dropout=dropout if num_layers > 1 else 0)
+                if attention_type == 'additive':
+                    self.attention = AdditiveAttention(hidden_size * 2)
+                else:
+                    self.attention = MultiHeadAttention(hidden_size * 2, num_heads=4)
                 
-                out = self.dropout(context)
-                out = self.fc1(out)
+                self.fc1 = nn.Linear(hidden_size * 2, 128)
+                self.layer_norm_out = nn.LayerNorm(128)
+                self.relu = nn.ReLU(inplace=True)
+                self.dropout = nn.Dropout(dropout)
+                self.fc2 = nn.Linear(128, num_classes)
+                
+            def forward(self, x):
+                x = self.layer_norm_in(x)
+                lstm_out, _ = self.lstm(x)
+                context, attention_weights = self.attention(lstm_out)
+                
+                # Global Average Pooling for MultiHeadAttention output if 3D
+                if context.dim() == 3:
+                    context = context.mean(dim=1)
+                
+                out = self.fc1(context)
+                out = self.layer_norm_out(out)
                 out = self.relu(out)
                 out = self.dropout(out)
                 out = self.fc2(out)
                 return out
         
-        model = BiLSTM_Attention(num_classes=self.num_classes)
+        model = BiLSTM_Attention(input_size=75, num_classes=self.num_classes)
         checkpoint = torch.load(model_path, map_location=self.device)
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
@@ -173,23 +220,54 @@ class HybridASLRecognizer:
             points.append((int(norm_x * w), int(norm_y * h)))
         
         for connection in self.hand_connections:
-            if connection[0] < len(points) and connection[1] < len(points):
-                cv2.line(img, points[connection[0]], points[connection[1]], (255, 255, 255), 2)
+            pt1_idx, pt2_idx, part = connection
+            if pt1_idx < len(points) and pt2_idx < len(points):
+                color = self.finger_colors[part]
+                cv2.line(img, points[pt1_idx], points[pt2_idx], color, 1, cv2.LINE_AA)
         
         for pt in points:
-            cv2.circle(img, pt, 3, (0, 255, 0), -1)
+            cv2.circle(img, pt, 2, (255, 255, 255), -1)
         
         return img
     
     def extract_keypoints(self, hand_landmarks):
-        """Trích xuất keypoints từ hand landmarks"""
-        keypoints = []
+        """Trích xuất keypoints ROBUST (Wrist-relative + Distances + Crossing)"""
+        # 1. Cơ bản: Wrist-relative landmarks (63 features)
+        wrist = hand_landmarks.landmark[0]
+        kp_list = []
         for lm in hand_landmarks.landmark:
-            keypoints.extend([lm.x, lm.y, lm.z])
-        # Pad to 63 features (21x3)
-        while len(keypoints) < 63:
-            keypoints.append(0.0)
-        return np.array(keypoints[:63])
+            kp_list.append([lm.x - wrist.x, lm.y - wrist.y, lm.z - wrist.z])
+        
+        kp_array = np.array(kp_list) # (21, 3)
+        features = kp_array.flatten() # (63,)
+        
+        # 2. Đặc trưng khoảng cách đầu ngón (10 features)
+        # Các chỉ số đầu ngón: 4(thumb), 8(index), 12(middle), 16(ring), 20(pinky)
+        tips = [4, 8, 12, 16, 20]
+        extra_dists = []
+        for i in range(len(tips)):
+            for j in range(i + 1, len(tips)):
+                p1 = kp_array[tips[i]]
+                p2 = kp_array[tips[j]]
+                dist = np.linalg.norm(p1 - p2)
+                extra_dists.append(dist)
+        
+        # 3. Đặc trưng bắt chéo (Phân biệt U và R) (2 features)
+        # Dùng np.sign để đồng nhất hoàn toàn với logic trong notebook
+        diff_x = kp_array[12][0] - kp_array[8][0]
+        is_crossed_x = np.sign(diff_x)
+        
+        diff_z = kp_array[12][2] - kp_array[8][2]
+        is_crossed_z = np.sign(diff_z)
+        
+        # Gộp tất cả: 63 + 10 + 2 = 75 features
+        final_features = np.concatenate([
+            features, 
+            np.array(extra_dists), 
+            np.array([is_crossed_x, is_crossed_z])
+        ])
+        
+        return final_features
     
     def detect_motion(self, current_keypoints):
         """Phát hiện chuyển động để quyết định dùng model nào"""
@@ -204,18 +282,28 @@ class HybridASLRecognizer:
         return movement > self.motion_threshold
     
     def predict_static(self, bone_img):
-        """Dự đoán bằng CNN (cho ký tự tĩnh)"""
+        """Dự đoán bằng CNN với TTA + Temperature Scaling"""
         img = cv2.resize(bone_img, (self.img_size, self.img_size))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = img.astype(np.float32) / 255.0
-        # Bước cực kỳ quan trọng: NORMALIZE giống hệt lúc train!
-        img = (img - 0.5) / 0.5
-        img = np.transpose(img, (2, 0, 1))
-        img_tensor = torch.FloatTensor(img).unsqueeze(0).to(self.device)
+        img = (img - 0.5) / 0.5  # Normalize: mean=0.5, std=0.5
+        
+        # TTA: Dự đoán cả ảnh gốc và ảnh lật ngang, lấy trung bình logits
+        img_orig = np.transpose(img, (2, 0, 1))
+        img_flip = np.transpose(img[:, ::-1, :].copy(), (2, 0, 1))  # Flip ngang
+        
+        batch = torch.FloatTensor(np.stack([img_orig, img_flip])).to(self.device)
         
         with torch.no_grad():
-            outputs = self.cnn_model(img_tensor)
-            probs = torch.softmax(outputs, dim=1)
-            confidence, predicted = torch.max(probs, 1)
+            logits = self.cnn_model(batch)
+            avg_logits = logits.mean(dim=0)  # Trung bình logits (trước softmax)
+            
+            # Temperature Scaling: T < 1 làm nhọn phân phối, tăng confidence
+            # T=0.35 phù hợp khi confidence thực tế 20-40% mà nhận đúng
+            TEMPERATURE = 0.35
+            scaled_logits = avg_logits / TEMPERATURE
+            probs = torch.softmax(scaled_logits, dim=0)
+            confidence, predicted = torch.max(probs, 0)
         
         return self.idx_to_class[predicted.item()], confidence.item() * 100
     
@@ -269,14 +357,19 @@ class HybridASLRecognizer:
             prediction = None
             confidence = 0.0
             
+            prev_mode = self.current_mode
+            
             if is_moving:
                 # Đang có chuyển động -> dùng BiLSTM
                 self.dynamic_counter += 1
                 self.static_counter = 0
                 
                 if self.dynamic_counter > 5:  # Giảm độ trễ
-                    prediction, confidence = self.predict_dynamic()
-                    self.current_mode = "dynamic"
+                    raw_pred, confidence = self.predict_dynamic()
+                    # Lọc bỏ chuỗi Loading_Buffer (buffer chưa đủ frames)
+                    if not raw_pred.startswith("Loading_Buffer"):
+                        prediction = raw_pred
+                        self.current_mode = "dynamic"
             else:
                 # Tĩnh -> dùng CNN
                 self.static_counter += 1
@@ -286,18 +379,26 @@ class HybridASLRecognizer:
                     prediction, confidence = self.predict_static(bone_img)
                     self.current_mode = "static"
             
+            # Clear buffer khi đổi mode để tránh lẫn lộn CNN/BiLSTM
+            if self.current_mode != prev_mode:
+                self.prediction_buffer.clear()
+            
             # Lưu vào buffer để làm mượt (tránh nháy chữ)
             if prediction is not None:
                 self.prediction_buffer.append((prediction, confidence))
                 
-            # Trích xuất kết quả mượt từ buffer thay vì kết quả tức thời
+            # Smoothing: vote có trọng số theo confidence
             if len(self.prediction_buffer) > 0:
-                from collections import Counter
-                classes = [p[0] for p in self.prediction_buffer]
-                most_common = Counter(classes).most_common(1)[0][0]
-                confs = [p[1] for p in self.prediction_buffer if p[0] == most_common]
+                # Tính tổng confidence cho từng class (weighted voting)
+                score_map = {}
+                for pred, conf in self.prediction_buffer:
+                    score_map[pred] = score_map.get(pred, 0) + conf
                 
-                prediction = most_common
+                # Chọn class có tổng confidence cao nhất
+                best_pred = max(score_map, key=score_map.get)
+                confs = [c for p, c in self.prediction_buffer if p == best_pred]
+                
+                prediction = best_pred
                 confidence = sum(confs) / len(confs)
             
             return frame, bone_img, prediction, confidence, self.current_mode
@@ -378,7 +479,7 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, mode_colors.get(mode, (128, 128, 128)), 2)
         
         # Prediction
-        if prediction:
+        if prediction is not None:
             color = (0, 255, 0) if confidence > 80 else ((0, 255, 255) if confidence > 60 else (0, 0, 255))
             text = f"Prediction: {prediction} ({confidence:.1f}%)"
             cv2.putText(processed_frame, text, (10, 100),
