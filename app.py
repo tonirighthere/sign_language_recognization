@@ -12,8 +12,7 @@ import time
 import json
 
 class HybridASLRecognizer:
-    def __init__(self, cnn_model_path, bilstm_model_path, metadata_path, 
-                 img_size=224, seq_length=30):
+    def __init__(self, cnn_model_path, bilstm_model_path, metadata_path, img_size=224, seq_length=30):
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.img_size = img_size
@@ -44,6 +43,7 @@ class HybridASLRecognizer:
         self.static_counter = 0
         self.dynamic_counter = 0
         self.force_mode = "auto"  # auto, static, hoặc dynamic
+        self.motion_frames_count = 0
         
         # Initialize MediaPipe
         self.mp_hands = mp.solutions.hands
@@ -282,26 +282,22 @@ class HybridASLRecognizer:
         return movement > self.motion_threshold
     
     def predict_static(self, bone_img):
-        """Dự đoán bằng CNN với TTA + Temperature Scaling"""
+        """Dự đoán bằng CNN (Đã bỏ lật ngang ảnh)"""
         img = cv2.resize(bone_img, (self.img_size, self.img_size))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = img.astype(np.float32) / 255.0
         img = (img - 0.5) / 0.5  # Normalize: mean=0.5, std=0.5
         
-        # TTA: Dự đoán cả ảnh gốc và ảnh lật ngang, lấy trung bình logits
+        # Chỉ dùng ảnh gốc
         img_orig = np.transpose(img, (2, 0, 1))
-        img_flip = np.transpose(img[:, ::-1, :].copy(), (2, 0, 1))  # Flip ngang
-        
-        batch = torch.FloatTensor(np.stack([img_orig, img_flip])).to(self.device)
+        batch = torch.FloatTensor(np.expand_dims(img_orig, axis=0)).to(self.device)
         
         with torch.no_grad():
-            logits = self.cnn_model(batch)
-            avg_logits = logits.mean(dim=0)  # Trung bình logits (trước softmax)
+            logits = self.cnn_model(batch)[0] # Lấy sample đầu tiên
             
-            # Temperature Scaling: T < 1 làm nhọn phân phối, tăng confidence
-            # T=0.35 phù hợp khi confidence thực tế 20-40% mà nhận đúng
+            # Temperature Scaling
             TEMPERATURE = 0.35
-            scaled_logits = avg_logits / TEMPERATURE
+            scaled_logits = logits / TEMPERATURE
             probs = torch.softmax(scaled_logits, dim=0)
             confidence, predicted = torch.max(probs, 0)
         
@@ -352,7 +348,7 @@ class HybridASLRecognizer:
                 is_moving = True
             else:
                 is_moving = self.detect_motion(keypoints)
-            
+
             # Quyết định dùng model nào
             prediction = None
             confidence = 0.0
@@ -363,19 +359,32 @@ class HybridASLRecognizer:
                 # Đang có chuyển động -> dùng BiLSTM
                 self.dynamic_counter += 1
                 self.static_counter = 0
+                self.motion_frames_count = min(self.motion_frames_count + 1, self.seq_length)
                 
-                if self.dynamic_counter > 5:  # Giảm độ trễ
-                    raw_pred, confidence = self.predict_dynamic()
-                    # Lọc bỏ chuỗi Loading_Buffer (buffer chưa đủ frames)
-                    if not raw_pred.startswith("Loading_Buffer"):
-                        prediction = raw_pred
+                # CHỈ TIN TƯỞNG BiLSTM khi đã gom đủ ít nhất 15 frames chuyển động thực sự
+                if self.dynamic_counter > 5:  
+                    if self.motion_frames_count >= 15:
+                        raw_pred, conf = self.predict_dynamic()
+                        if not raw_pred.startswith("Loading_Buffer"):
+                            # Lọc gắt: Phải chắc chắn > 70% mới chốt kết quả, tránh đoán mò giữa chừng
+                            if conf > 70.0:
+                                prediction = raw_pred
+                                confidence = conf
+                            else:
+                                prediction = "Recognizing Motion..."
+                                confidence = conf
+                        self.current_mode = "dynamic"
+                    else:
+                        prediction = "Capturing Sequence..."
+                        confidence = 0.0
                         self.current_mode = "dynamic"
             else:
                 # Tĩnh -> dùng CNN
                 self.static_counter += 1
                 self.dynamic_counter = 0
+                self.motion_frames_count = 0  # Reset đếm frame chuyển động
                 
-                if self.static_counter > 2:  # Giảm độ trễ
+                if self.static_counter > 2:  
                     prediction, confidence = self.predict_static(bone_img)
                     self.current_mode = "static"
             
